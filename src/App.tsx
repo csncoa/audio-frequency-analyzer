@@ -621,7 +621,7 @@ export default function App() {
                       >
                         Browse File
                       </button>
-                      <p className="text-[10px] text-[#4a5568] mono">Supported: .wav — Max 50 MB</p>
+                      <p className="text-[10px] text-[#4a5568] mono">Supported: .wav — Full tracks supported</p>
                     </div>
                   ) : (
                     <div className="space-y-3">
