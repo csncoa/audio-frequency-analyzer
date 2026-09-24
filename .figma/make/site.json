@@ -1,1 +1,10 @@
-{}
+{
+  "description": "Upload and analyze WAV audio files to visualize waveforms and frequency spectra, identifying dominant frequencies for digital signal processing insights.",
+  "robots": {
+    "index": false
+  },
+  "accessibility": {
+    "addBypassLinks": false,
+    "ignoreReducedMotion": false
+  }
+}
