@@ -1,4 +1,4 @@
-import { useState, useRef, useCallback, useEffect } from 'react'
+import { useState, useRef, useCallback, useEffect, useMemo } from 'react'
 import {
   LineChart, Line, BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip,
   ResponsiveContainer, ReferenceLine, Cell
@@ -8,6 +8,8 @@ import {
   generateDemoAudioData,
   analyzeAudioFile,
 } from './utils/dsp'
+import { RealtimeAudioAnalyzer } from './utils/realtimeAudio'
+import { LiveOscilloscope, LiveSpectrumBars } from './components/LiveVisualizers'
 
 // ── Sidebar nav items ──────────────────────────────────────────────────────────
 const NAV_ITEMS = [
@@ -94,17 +96,25 @@ function FFTTooltip({ active, payload, label }: any) {
 
 // ── Stat Card ─────────────────────────────────────────────────────────────────
 function StatCard({
-  label, value, unit, sub, accent = false
-}: { label: string; value: string; unit: string; sub?: string; accent?: boolean }) {
+  label, value, unit, sub, accent = false, live = false
+}: { label: string; value: string; unit: string; sub?: string; accent?: boolean; live?: boolean }) {
   return (
     <div
-      className={`rounded-xl p-5 border flex flex-col gap-2 transition-all duration-200 ${
+      className={`rounded-xl p-5 border flex flex-col gap-2 transition-all duration-200 relative overflow-hidden ${
         accent
           ? 'bg-[#0d1c3a] border-[#22d3ee]/40 shadow-[0_0_24px_rgba(34,211,238,0.12)]'
           : 'bg-[#111d33] border-[#1e2e4a] hover:border-[#2a4070]'
       }`}
     >
-      <p className="text-[11px] uppercase tracking-widest text-[#64748b] font-medium">{label}</p>
+      <div className="flex items-center justify-between">
+        <p className="text-[11px] uppercase tracking-widest text-[#64748b] font-medium">{label}</p>
+        {live && (
+          <span className="flex items-center gap-1 text-[9px] px-1.5 py-0.5 rounded bg-cyan-950 text-[#22d3ee] border border-[#22d3ee]/40 mono animate-pulse font-semibold">
+            <span className="w-1.5 h-1.5 rounded-full bg-[#22d3ee]" />
+            LIVE
+          </span>
+        )}
+      </div>
       <div className="flex items-end gap-1.5">
         <span className={`text-2xl font-bold mono leading-none ${accent ? 'text-[#22d3ee]' : 'text-[#e2e8f0]'}`}>
           {value}
@@ -136,6 +146,17 @@ export default function App() {
   const [analyzing, setAnalyzing] = useState(false)
   const [analysisError, setAnalysisError] = useState<string | null>(null)
 
+  // Real-time Visualizer Mode: 'live' | 'static'
+  const [waveformView, setWaveformView] = useState<'live' | 'static'>('live')
+  const [fftView, setFftView] = useState<'live' | 'static'>('live')
+
+  // Live frequency tracker during playback
+  const [liveFreqInfo, setLiveFreqInfo] = useState<{ freq: number; note: string; magnitude: number }>({
+    freq: 440,
+    note: 'A4',
+    magnitude: 0.85,
+  })
+
   // Player state
   const [playing, setPlaying] = useState(false)
   const [progress, setProgress] = useState(0)
@@ -148,6 +169,9 @@ export default function App() {
   const progressInterval = useRef<ReturnType<typeof setInterval> | null>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
 
+  // Singleton instance of RealtimeAudioAnalyzer
+  const realtimeAnalyzer = useMemo(() => new RealtimeAudioAnalyzer(), [])
+
   // Stop synthetic audio if any
   const stopSyntheticTone = useCallback(() => {
     if (synthOscRef.current) {
@@ -159,14 +183,36 @@ export default function App() {
     }
   }, [])
 
-  // Process file upload
+  // Auto-analyze audio immediately upon file upload
+  const processAndAnalyzeFile = async (f: File) => {
+    setAnalyzing(true)
+    setAnalysisError(null)
+
+    try {
+      // Decode WAV and calculate real Cooley-Tukey Radix-2 FFT
+      const results = await analyzeAudioFile(f)
+      setSignalData(results)
+      setAnalyzed(true)
+      setLiveFreqInfo({
+        freq: results.dominantFrequency,
+        note: results.nearestNote,
+        magnitude: results.peakMagnitude,
+      })
+    } catch (err: any) {
+      console.error('DSP Analysis error:', err)
+      setAnalysisError(err?.message || 'Failed to decode and analyze WAV audio file.')
+    } finally {
+      setAnalyzing(false)
+    }
+  }
+
+  // Process file upload (Instant Auto-Analyze)
   const loadFile = (f: File) => {
     stopSyntheticTone()
     if (audioUrlRef.current) URL.revokeObjectURL(audioUrlRef.current)
 
     setFile(f)
     setIsDemo(false)
-    setAnalyzed(false)
     setPlaying(false)
     setProgress(0)
     setCurrentTime(0)
@@ -178,6 +224,9 @@ export default function App() {
       audioRef.current.src = url
       audioRef.current.load()
     }
+
+    // Auto-analyze immediately!
+    processAndAnalyzeFile(f)
   }
 
   const handleDrop = useCallback((e: React.DragEvent) => {
@@ -197,7 +246,7 @@ export default function App() {
   }
 
   // Audio Playback
-  const togglePlay = () => {
+  const togglePlay = async () => {
     if (playing) {
       if (isDemo) {
         stopSyntheticTone()
@@ -247,6 +296,12 @@ export default function App() {
         console.error('Web Audio synth error:', err)
       }
     } else if (audioRef.current && file) {
+      // Connect real-time analyzer if not already connected
+      if (!realtimeAnalyzer.isInitialized && audioRef.current) {
+        realtimeAnalyzer.init(audioRef.current)
+      }
+      await realtimeAnalyzer.resume()
+
       audioRef.current.volume = volume / 100
       audioRef.current.play().then(() => {
         setPlaying(true)
@@ -289,30 +344,17 @@ export default function App() {
     }
   }
 
-  // DSP Analysis Handler (Runs Real FFT & Waveform Extraction)
-  const handleAnalyze = async () => {
-    if (!file) return
-    setAnalyzing(true)
-    setAnalysisError(null)
-
-    try {
-      // Decode WAV and calculate real Cooley-Tukey Radix-2 FFT
-      const results = await analyzeAudioFile(file)
-      setSignalData(results)
-      setAnalyzed(true)
-    } catch (err: any) {
-      console.error('DSP Analysis error:', err)
-      setAnalysisError(err?.message || 'Failed to decode and analyze WAV audio file.')
-    } finally {
-      setAnalyzing(false)
-    }
-  }
-
   const handleReset = () => {
     stopSyntheticTone()
     setFile(null)
     setIsDemo(true)
-    setSignalData(generateDemoAudioData())
+    const demo = generateDemoAudioData()
+    setSignalData(demo)
+    setLiveFreqInfo({
+      freq: demo.dominantFrequency,
+      note: demo.nearestNote,
+      magnitude: demo.peakMagnitude,
+    })
     setAnalyzed(true)
     setPlaying(false)
     setProgress(0)
@@ -381,17 +423,18 @@ export default function App() {
   useEffect(() => {
     return () => {
       stopSyntheticTone()
+      realtimeAnalyzer.dispose()
       if (progressInterval.current) clearInterval(progressInterval.current)
       if (audioUrlRef.current) URL.revokeObjectURL(audioUrlRef.current)
     }
-  }, [stopSyntheticTone])
+  }, [stopSyntheticTone, realtimeAnalyzer])
 
   // Filter FFT data points to keep bar chart responsive
   const fftChartData = signalData.fftData.filter((_, i) => i % 2 === 0)
 
   return (
     <div className="flex h-screen overflow-hidden" style={{ fontFamily: 'Inter, sans-serif', background: '#080d1a', color: '#e2e8f0' }}>
-      <audio ref={audioRef} />
+      <audio ref={audioRef} crossOrigin="anonymous" />
 
       {/* ── Sidebar ─────────────────────────────────────────────────────────── */}
       <aside className="w-60 flex-shrink-0 flex flex-col border-r border-[#1e2e4a] bg-[#0d1526]">
@@ -432,7 +475,7 @@ export default function App() {
             onClick={handleReset}
             className="w-full py-2 px-3 rounded-lg text-[11px] font-medium bg-[#111d33] border border-[#1e2e4a] text-[#94a3b8] hover:text-[#22d3ee] hover:border-[#22d3ee]/30 transition-all flex items-center justify-between"
           >
-            <span>Load 440 Hz Demo</span>
+            <span>Reset to 440 Hz Demo</span>
             <span className="w-1.5 h-1.5 rounded-full bg-[#22d3ee]" />
           </button>
         </div>
@@ -440,7 +483,7 @@ export default function App() {
         {/* Info Box */}
         <div className="mx-3 mb-4 p-3 rounded-lg bg-[#111d33] border border-[#1e2e4a]">
           <p className="text-[10px] text-[#64748b] leading-relaxed">
-            Analyze audio signals in time and frequency domains using Fast Fourier Transform.
+            Real-time Web Audio API &amp; Cooley-Tukey Fast Fourier Transform (FFT) analysis.
           </p>
         </div>
       </aside>
@@ -458,12 +501,22 @@ export default function App() {
           <div className="flex items-center gap-3">
             {isDemo && (
               <span className="text-[11px] px-2 py-0.5 rounded bg-cyan-950 text-[#22d3ee] border border-[#22d3ee]/30 mono">
-                Demo Mode
+                Demo Reference Tone
               </span>
             )}
             <div className="flex items-center gap-2">
-              <span className={`w-2 h-2 rounded-full ${analyzing ? 'bg-amber-400 animate-ping' : 'bg-emerald-400 animate-pulse'}`} />
-              <span className="text-[11px] text-[#94a3b8] mono">{analyzing ? 'Processing FFT…' : 'Ready'}</span>
+              <span
+                className={`w-2 h-2 rounded-full ${
+                  analyzing
+                    ? 'bg-amber-400 animate-ping'
+                    : playing
+                    ? 'bg-[#22d3ee] animate-pulse'
+                    : 'bg-emerald-400 animate-pulse'
+                }`}
+              />
+              <span className="text-[11px] text-[#94a3b8] mono">
+                {analyzing ? 'Auto-Analyzing File…' : playing ? 'Live Real-time' : 'Ready'}
+              </span>
             </div>
           </div>
         </header>
@@ -483,7 +536,7 @@ export default function App() {
                 <div className="space-y-3">
                   <h3 className="text-sm font-semibold text-[#e2e8f0]">1. Fast Fourier Transform (FFT)</h3>
                   <p>
-                    The Discrete Fourier Transform (DFT) transforms a time-domain signal $x(n)$ into its complex frequency-domain spectrum $X(k)$:
+                    The Discrete Fourier Transform (DFT) transforms a time-domain signal x(n) into its complex frequency-domain spectrum X(k):
                   </p>
                   <div className="p-3 bg-[#0d1526] border border-[#1e2e4a] rounded-lg mono text-[11px] text-[#22d3ee]">
                     X(k) = Σ [n=0 to N-1] x(n) · e^(-j · 2π · k · n / N)
@@ -534,9 +587,14 @@ export default function App() {
 
                 {/* Upload Card */}
                 <Card className="p-5">
-                  <p className="text-[11px] font-semibold uppercase tracking-widest text-[#64748b] mb-4">
-                    Upload Audio Signal
-                  </p>
+                  <div className="flex items-center justify-between mb-4">
+                    <p className="text-[11px] font-semibold uppercase tracking-widest text-[#64748b]">
+                      Upload Audio Signal
+                    </p>
+                    <span className="text-[10px] mono text-[#22d3ee] bg-[#22d3ee]/10 px-2 py-0.5 rounded border border-[#22d3ee]/20">
+                      ⚡ Auto-Analyze On
+                    </span>
+                  </div>
 
                   {!file ? (
                     <div
@@ -555,7 +613,7 @@ export default function App() {
                       </div>
                       <div className="text-center">
                         <p className="text-sm text-[#94a3b8] font-medium">Drag &amp; drop your WAV file here</p>
-                        <p className="text-[11px] text-[#64748b] mt-1">or click to browse</p>
+                        <p className="text-[11px] text-[#64748b] mt-1">Files are analyzed automatically upon import</p>
                       </div>
                       <button
                         type="button"
@@ -606,9 +664,16 @@ export default function App() {
 
                 {/* Audio Player Card */}
                 <Card className="p-5">
-                  <p className="text-[11px] font-semibold uppercase tracking-widest text-[#64748b] mb-4">
-                    Audio Player
-                  </p>
+                  <div className="flex items-center justify-between mb-4">
+                    <p className="text-[11px] font-semibold uppercase tracking-widest text-[#64748b]">
+                      Audio Player
+                    </p>
+                    {playing && (
+                      <span className="text-[10px] mono text-[#22d3ee] bg-[#22d3ee]/10 px-2 py-0.5 rounded border border-[#22d3ee]/20 animate-pulse">
+                        ▶ Live Streaming FFT
+                      </span>
+                    )}
+                  </div>
 
                   <div className="flex flex-col gap-4">
                     {/* Track info */}
@@ -687,68 +752,125 @@ export default function App() {
                   sub="N = sr × duration"
                 />
                 <StatCard
-                  label="Dominant Frequency"
-                  value={signalData.dominantFrequency.toLocaleString()}
+                  label={playing ? 'Live Dominant Freq' : 'Dominant Frequency'}
+                  value={playing ? liveFreqInfo.freq.toLocaleString() : signalData.dominantFrequency.toLocaleString()}
                   unit="Hz"
-                  sub={`Nearest Note: ${signalData.nearestNote}`}
+                  sub={`Pitch Note: ${playing ? liveFreqInfo.note : signalData.nearestNote}`}
                   accent
+                  live={playing}
                 />
               </div>
 
               {/* Row 3: Waveform Visualization */}
               {(activeNav === 'dashboard' || activeNav === 'analysis') && (
                 <Card className="p-5">
-                  <div className="flex items-start justify-between mb-4">
+                  <div className="flex items-center justify-between mb-4">
                     <div>
-                      <p className="text-[13px] font-semibold text-[#e2e8f0]">Time Domain — Waveform</p>
-                      <p className="text-[11px] text-[#64748b] mt-0.5">Amplitude of the audio signal over time.</p>
+                      <div className="flex items-center gap-2">
+                        <p className="text-[13px] font-semibold text-[#e2e8f0]">Time Domain — Waveform</p>
+                        {playing && (
+                          <span className="flex items-center gap-1 text-[9px] px-1.5 py-0.5 rounded bg-[#22d3ee]/10 text-[#22d3ee] border border-[#22d3ee]/20 mono">
+                            <span className="w-1.5 h-1.5 rounded-full bg-[#22d3ee] animate-ping" />
+                            Live 60fps
+                          </span>
+                        )}
+                      </div>
+                      <p className="text-[11px] text-[#64748b] mt-0.5">
+                        {waveformView === 'live' && playing
+                          ? 'Real-time live oscilloscope waveform while playing.'
+                          : 'Full signal amplitude over time (downsampled discrete points).'}
+                      </p>
                     </div>
+
                     <div className="flex items-center gap-2">
-                      <span className="mono text-[10px] text-[#22d3ee] bg-[#22d3ee]/10 border border-[#22d3ee]/20 px-2 py-0.5 rounded">
-                        x(t)
-                      </span>
+                      <div className="flex items-center p-0.5 rounded-lg bg-[#0d1526] border border-[#1e2e4a] text-[11px] mono">
+                        <button
+                          onClick={() => setWaveformView('live')}
+                          className={`px-2 py-0.5 rounded ${waveformView === 'live' ? 'bg-[#22d3ee] text-[#080d1a] font-bold' : 'text-[#64748b] hover:text-[#e2e8f0]'}`}
+                        >
+                          Live Oscilloscope
+                        </button>
+                        <button
+                          onClick={() => setWaveformView('static')}
+                          className={`px-2 py-0.5 rounded ${waveformView === 'static' ? 'bg-[#22d3ee] text-[#080d1a] font-bold' : 'text-[#64748b] hover:text-[#e2e8f0]'}`}
+                        >
+                          Full Waveform
+                        </button>
+                      </div>
                     </div>
                   </div>
 
-                  <ResponsiveContainer width="100%" height={activeNav === 'analysis' ? 260 : 180}>
-                    <LineChart data={signalData.waveformData} margin={{ top: 4, right: 8, left: -20, bottom: 4 }}>
-                      <CartesianGrid strokeDasharray="3 3" stroke="#1e2e4a" vertical={false} />
-                      <XAxis
-                        dataKey="t" tickLine={false} axisLine={false}
-                        tick={{ fontSize: 10, fill: '#64748b', fontFamily: 'JetBrains Mono' }}
-                        tickFormatter={v => `${v}s`}
-                        interval={Math.floor(signalData.waveformData.length / 6)}
-                      />
-                      <YAxis
-                        tickLine={false} axisLine={false}
-                        tick={{ fontSize: 10, fill: '#64748b', fontFamily: 'JetBrains Mono' }}
-                        domain={[-1.2, 1.2]}
-                        tickCount={5}
-                      />
-                      <Tooltip content={<WaveTooltip />} />
-                      <ReferenceLine y={0} stroke="#2a4070" strokeWidth={1} />
-                      <Line
-                        type="monotone" dataKey="v" stroke="#22d3ee" strokeWidth={1.5}
-                        dot={false} activeDot={{ r: 3, fill: '#22d3ee' }}
-                      />
-                    </LineChart>
-                  </ResponsiveContainer>
+                  {waveformView === 'live' ? (
+                    <LiveOscilloscope
+                      analyzer={realtimeAnalyzer}
+                      isPlaying={playing}
+                      height={activeNav === 'analysis' ? 260 : 180}
+                    />
+                  ) : (
+                    <ResponsiveContainer width="100%" height={activeNav === 'analysis' ? 260 : 180}>
+                      <LineChart data={signalData.waveformData} margin={{ top: 4, right: 8, left: -20, bottom: 4 }}>
+                        <CartesianGrid strokeDasharray="3 3" stroke="#1e2e4a" vertical={false} />
+                        <XAxis
+                          dataKey="t" tickLine={false} axisLine={false}
+                          tick={{ fontSize: 10, fill: '#64748b', fontFamily: 'JetBrains Mono' }}
+                          tickFormatter={v => `${v}s`}
+                          interval={Math.floor(signalData.waveformData.length / 6)}
+                        />
+                        <YAxis
+                          tickLine={false} axisLine={false}
+                          tick={{ fontSize: 10, fill: '#64748b', fontFamily: 'JetBrains Mono' }}
+                          domain={[-1.2, 1.2]}
+                          tickCount={5}
+                        />
+                        <Tooltip content={<WaveTooltip />} />
+                        <ReferenceLine y={0} stroke="#2a4070" strokeWidth={1} />
+                        <Line
+                          type="monotone" dataKey="v" stroke="#22d3ee" strokeWidth={1.5}
+                          dot={false} activeDot={{ r: 3, fill: '#22d3ee' }}
+                        />
+                      </LineChart>
+                    </ResponsiveContainer>
+                  )}
                 </Card>
               )}
 
               {/* Row 4: FFT Spectrum Visualization */}
               {(activeNav === 'dashboard' || activeNav === 'fft') && (
                 <Card className="p-5">
-                  <div className="flex items-start justify-between mb-3">
+                  <div className="flex items-center justify-between mb-3">
                     <div>
-                      <p className="text-[13px] font-semibold text-[#e2e8f0]">Frequency Domain — FFT Spectrum</p>
+                      <div className="flex items-center gap-2">
+                        <p className="text-[13px] font-semibold text-[#e2e8f0]">Frequency Domain — FFT Spectrum</p>
+                        {playing && (
+                          <span className="flex items-center gap-1 text-[9px] px-1.5 py-0.5 rounded bg-[#22d3ee]/10 text-[#22d3ee] border border-[#22d3ee]/20 mono">
+                            <span className="w-1.5 h-1.5 rounded-full bg-[#22d3ee] animate-ping" />
+                            Live FFT 60fps
+                          </span>
+                        )}
+                      </div>
                       <p className="text-[11px] text-[#64748b] mt-0.5">
-                        Frequency components obtained using Fast Fourier Transform (FFT).
+                        {fftView === 'live' && playing
+                          ? 'Real-time frequency components pulsing to audio playback.'
+                          : 'Frequency components obtained using Fast Fourier Transform (FFT).'}
                       </p>
                     </div>
-                    <span className="mono text-[10px] text-[#3b82f6] bg-[#3b82f6]/10 border border-[#3b82f6]/20 px-2 py-0.5 rounded">
-                      |X(f)|
-                    </span>
+
+                    <div className="flex items-center gap-2">
+                      <div className="flex items-center p-0.5 rounded-lg bg-[#0d1526] border border-[#1e2e4a] text-[11px] mono">
+                        <button
+                          onClick={() => setFftView('live')}
+                          className={`px-2 py-0.5 rounded ${fftView === 'live' ? 'bg-[#22d3ee] text-[#080d1a] font-bold' : 'text-[#64748b] hover:text-[#e2e8f0]'}`}
+                        >
+                          Live Spectrum (60 FPS)
+                        </button>
+                        <button
+                          onClick={() => setFftView('static')}
+                          className={`px-2 py-0.5 rounded ${fftView === 'static' ? 'bg-[#22d3ee] text-[#080d1a] font-bold' : 'text-[#64748b] hover:text-[#e2e8f0]'}`}
+                        >
+                          Overall FFT
+                        </button>
+                      </div>
+                    </div>
                   </div>
 
                   {/* Dominant freq badge */}
@@ -756,44 +878,55 @@ export default function App() {
                     <div className="flex items-center gap-1.5">
                       <span className="w-2 h-2 rounded-full bg-[#22d3ee]" />
                       <span className="text-[11px] mono font-semibold text-[#22d3ee]">
-                        Dominant Frequency: {signalData.dominantFrequency} Hz ({signalData.nearestNote})
+                        {playing ? 'Live Peak:' : 'Dominant Frequency:'}{' '}
+                        {playing ? liveFreqInfo.freq : signalData.dominantFrequency} Hz (
+                        {playing ? liveFreqInfo.note : signalData.nearestNote})
                       </span>
                     </div>
-                    {signalData.secondaryHarmonics.length > 0 && (
+                    {signalData.secondaryHarmonics.length > 0 && !playing && (
                       <div className="flex items-center gap-1.5 text-[11px] mono text-[#3b82f6]">
                         <span>Harmonics: {signalData.secondaryHarmonics.join(', ')} Hz</span>
                       </div>
                     )}
                   </div>
 
-                  <ResponsiveContainer width="100%" height={activeNav === 'fft' ? 280 : 200}>
-                    <BarChart data={fftChartData} margin={{ top: 4, right: 8, left: -20, bottom: 4 }} barCategoryGap={0}>
-                      <CartesianGrid strokeDasharray="3 3" stroke="#1e2e4a" vertical={false} />
-                      <XAxis
-                        dataKey="hz" tickLine={false} axisLine={false}
-                        tick={{ fontSize: 10, fill: '#64748b', fontFamily: 'JetBrains Mono' }}
-                        tickFormatter={v => `${v}`}
-                        interval={Math.floor(fftChartData.length / 8)}
-                        label={{ value: 'Hz', position: 'insideRight', fill: '#64748b', fontSize: 10 }}
-                      />
-                      <YAxis
-                        tickLine={false} axisLine={false}
-                        tick={{ fontSize: 10, fill: '#64748b', fontFamily: 'JetBrains Mono' }}
-                        domain={[0, 1]}
-                        tickCount={4}
-                      />
-                      <Tooltip content={<FFTTooltip />} />
-                      <Bar dataKey="mag" radius={[1, 1, 0, 0]}>
-                        {fftChartData.map((entry, i) => (
-                          <Cell
-                            key={i}
-                            fill={entry.dominant ? '#22d3ee' : entry.isHarmonic ? '#38bdf8' : entry.mag > 0.2 ? '#3b82f6' : '#1d4ed8'}
-                            opacity={entry.dominant ? 1 : entry.isHarmonic ? 0.9 : entry.mag > 0.2 ? 0.8 : 0.45}
-                          />
-                        ))}
-                      </Bar>
-                    </BarChart>
-                  </ResponsiveContainer>
+                  {fftView === 'live' ? (
+                    <LiveSpectrumBars
+                      analyzer={realtimeAnalyzer}
+                      isPlaying={playing}
+                      height={activeNav === 'fft' ? 280 : 200}
+                      onLiveDominantChange={setLiveFreqInfo}
+                    />
+                  ) : (
+                    <ResponsiveContainer width="100%" height={activeNav === 'fft' ? 280 : 200}>
+                      <BarChart data={fftChartData} margin={{ top: 4, right: 8, left: -20, bottom: 4 }} barCategoryGap={0}>
+                        <CartesianGrid strokeDasharray="3 3" stroke="#1e2e4a" vertical={false} />
+                        <XAxis
+                          dataKey="hz" tickLine={false} axisLine={false}
+                          tick={{ fontSize: 10, fill: '#64748b', fontFamily: 'JetBrains Mono' }}
+                          tickFormatter={v => `${v}`}
+                          interval={Math.floor(fftChartData.length / 8)}
+                          label={{ value: 'Hz', position: 'insideRight', fill: '#64748b', fontSize: 10 }}
+                        />
+                        <YAxis
+                          tickLine={false} axisLine={false}
+                          tick={{ fontSize: 10, fill: '#64748b', fontFamily: 'JetBrains Mono' }}
+                          domain={[0, 1]}
+                          tickCount={4}
+                        />
+                        <Tooltip content={<FFTTooltip />} />
+                        <Bar dataKey="mag" radius={[1, 1, 0, 0]}>
+                          {fftChartData.map((entry, i) => (
+                            <Cell
+                              key={i}
+                              fill={entry.dominant ? '#22d3ee' : entry.isHarmonic ? '#38bdf8' : entry.mag > 0.2 ? '#3b82f6' : '#1d4ed8'}
+                              opacity={entry.dominant ? 1 : entry.isHarmonic ? 0.9 : entry.mag > 0.2 ? 0.8 : 0.45}
+                            />
+                          ))}
+                        </Bar>
+                      </BarChart>
+                    </ResponsiveContainer>
+                  )}
                 </Card>
               )}
 
@@ -838,7 +971,7 @@ export default function App() {
                         <SpectrumIcon size={18} />
                       </div>
                       <p className="text-[12px] text-[#64748b] text-center">
-                        Upload a WAV file and click<br />"Analyze Signal" to run FFT.
+                        Upload a WAV file to auto-analyze.
                       </p>
                     </div>
                   )}
@@ -851,7 +984,7 @@ export default function App() {
                   </p>
 
                   <button
-                    onClick={handleAnalyze}
+                    onClick={() => file && processAndAnalyzeFile(file)}
                     disabled={!file || analyzing}
                     className={`w-full py-3 rounded-xl text-[13px] font-semibold flex items-center justify-center gap-2 transition-all duration-200 ${
                       file && !analyzing
@@ -867,7 +1000,7 @@ export default function App() {
                         Computing FFT Analysis…
                       </>
                     ) : (
-                      <><SpectrumIcon size={14} /> Analyze Signal</>
+                      <><SpectrumIcon size={14} /> Re-Analyze Full Track</>
                     )}
                   </button>
 
