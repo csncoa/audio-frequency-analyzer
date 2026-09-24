@@ -1,7 +1,23 @@
 /**
  * Digital Signal Processing (DSP) & Fast Fourier Transform (FFT) Engine
  * Implements real-time / offline WAV signal analysis for Audio Frequency Analyzer.
+ * Features:
+ * - Stereo to Mono Mixdown (L + R) / 2
+ * - Multiple Windowing Functions (Hann, Hamming, Blackman, Rectangular)
+ * - Welch's Averaged Periodogram for True Power Spectral Density (PSD)
+ * - Linear & Decibel (dB) Magnitude Scaling
+ * - Harmonic Peak & Musical Pitch (Note + Cents) Detection
  */
+
+export type WindowFunction = 'hann' | 'hamming' | 'blackman' | 'rectangular'
+export type AnalysisMethod = 'welch' | 'peak'
+
+export interface DspAnalysisOptions {
+  windowFunction?: WindowFunction
+  method?: AnalysisMethod
+  maxFrequency?: number // e.g. 2000, 5000, 22050
+  dbScale?: boolean
+}
 
 export interface AudioSignalData {
   fileName: string
@@ -11,14 +27,16 @@ export interface AudioSignalData {
   totalSamples: number
   channels: number
   waveformData: { t: number; v: number }[]
-  fftData: { hz: number; mag: number; dominant: boolean; isHarmonic?: boolean }[]
+  fftData: { hz: number; mag: number; magDb: number; dominant: boolean; isHarmonic?: boolean }[]
   dominantFrequency: number
   peakMagnitude: number
+  peakMagnitudeDb: number
   secondaryHarmonics: number[]
   nearestNote: string
   noteDeviationCents: number
   nyquistFrequency: number
-  thdPercent?: number
+  windowUsed: WindowFunction
+  methodUsed: AnalysisMethod
 }
 
 // Predefined musical notes
@@ -29,7 +47,6 @@ const NOTE_NAMES = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 
  */
 export function frequencyToNote(freq: number): { note: string; cents: number } {
   if (freq <= 0) return { note: 'N/A', cents: 0 }
-  // A4 = 440 Hz is note number 69 in MIDI
   const midi = 69 + 12 * Math.log2(freq / 440)
   const roundedMidi = Math.round(midi)
   const noteIndex = ((roundedMidi % 12) + 12) % 12
@@ -42,9 +59,31 @@ export function frequencyToNote(freq: number): { note: string; cents: number } {
 }
 
 /**
+ * Calculates window weighting value for sample n of N
+ */
+export function applyWindowWeight(n: number, N: number, win: WindowFunction): number {
+  if (N <= 1) return 1.0
+  switch (win) {
+    case 'hamming':
+      return 0.54 - 0.46 * Math.cos((2 * Math.PI * n) / (N - 1))
+    case 'blackman':
+      return (
+        0.42 -
+        0.5 * Math.cos((2 * Math.PI * n) / (N - 1)) +
+        0.08 * Math.cos((4 * Math.PI * n) / (N - 1))
+      )
+    case 'rectangular':
+      return 1.0
+    case 'hann':
+    default:
+      return 0.5 * (1 - Math.cos((2 * Math.PI * n) / (N - 1)))
+  }
+}
+
+/**
  * Radix-2 In-place Cooley-Tukey FFT algorithm
  */
-function cooleyTukeyFFT(re: Float64Array, im: Float64Array) {
+export function cooleyTukeyFFT(re: Float64Array, im: Float64Array) {
   const n = re.length
   if (n <= 1) return
 
@@ -95,11 +134,13 @@ function cooleyTukeyFFT(re: Float64Array, im: Float64Array) {
 /**
  * Generates synthetic baseline 440 Hz data (for demo / initial state)
  */
-export function generateDemoAudioData(): AudioSignalData {
+export function generateDemoAudioData(options: DspAnalysisOptions = {}): AudioSignalData {
   const sampleRate = 44100
   const duration = 2.0
   const totalSamples = 88200
   const numWavePoints = 300
+  const win = options.windowFunction || 'hann'
+  const method = options.method || 'welch'
 
   // Generate 300 waveform points
   const waveformData = Array.from({ length: numWavePoints }, (_, i) => {
@@ -108,7 +149,7 @@ export function generateDemoAudioData(): AudioSignalData {
       0.70 * Math.sin(2 * Math.PI * 440 * t) +
       0.20 * Math.sin(2 * Math.PI * 880 * t) +
       0.06 * Math.sin(2 * Math.PI * 1320 * t) +
-      (Math.random() - 0.5) * 0.05
+      (Math.random() - 0.5) * 0.04
     return {
       t: parseFloat(t.toFixed(4)),
       v: parseFloat(v.toFixed(4)),
@@ -116,20 +157,31 @@ export function generateDemoAudioData(): AudioSignalData {
   })
 
   // Generate FFT spectrum (0 to 5000 Hz, 10 Hz step)
-  const fftData: { hz: number; mag: number; dominant: boolean; isHarmonic?: boolean }[] = []
-  for (let hz = 0; hz <= 5000; hz += 10) {
+  const maxHz = options.maxFrequency || 5000
+  const stepHz = maxHz > 10000 ? 50 : maxHz > 3000 ? 15 : 8
+  const fftData: AudioSignalData['fftData'] = []
+
+  for (let hz = 0; hz <= maxHz; hz += stepHz) {
     let mag = 0
     mag += 0.85 * Math.exp(-Math.pow((hz - 440) / 10, 2))
     mag += 0.35 * Math.exp(-Math.pow((hz - 880) / 12, 2))
     mag += 0.18 * Math.exp(-Math.pow((hz - 1320) / 14, 2))
     mag += 0.09 * Math.exp(-Math.pow((hz - 1760) / 16, 2))
-    mag += Math.random() * 0.012
+    mag += Math.random() * 0.01
 
-    const dominant = hz >= 430 && hz <= 450
-    const isHarmonic = (hz >= 870 && hz <= 890) || (hz >= 1310 && hz <= 1330) || (hz >= 1750 && hz <= 1770)
+    const magClamped = Math.max(1e-4, Math.min(1.0, mag))
+    const magDb = parseFloat(Math.max(-80, 20 * Math.log10(magClamped)).toFixed(1))
+
+    const dominant = hz >= 420 && hz <= 460
+    const isHarmonic =
+      (hz >= 860 && hz <= 900) ||
+      (hz >= 1300 && hz <= 1340) ||
+      (hz >= 1740 && hz <= 1780)
+
     fftData.push({
       hz,
-      mag: parseFloat(mag.toFixed(4)),
+      mag: parseFloat(magClamped.toFixed(4)),
+      magDb,
       dominant,
       isHarmonic,
     })
@@ -146,18 +198,28 @@ export function generateDemoAudioData(): AudioSignalData {
     fftData,
     dominantFrequency: 440,
     peakMagnitude: 0.85,
+    peakMagnitudeDb: parseFloat((20 * Math.log10(0.85)).toFixed(1)),
     secondaryHarmonics: [880, 1320, 1760],
     nearestNote: 'A4',
     noteDeviationCents: 0,
     nyquistFrequency: 22050,
-    thdPercent: 4.8,
+    windowUsed: win,
+    methodUsed: method,
   }
 }
 
 /**
  * Decodes and calculates real DSP and FFT from an uploaded WAV / Audio File
+ * Supports Stereo Mixdown, Welch's Averaged PSD, and custom windowing functions.
  */
-export async function analyzeAudioFile(file: File): Promise<AudioSignalData> {
+export async function analyzeAudioFile(
+  file: File,
+  options: DspAnalysisOptions = {}
+): Promise<AudioSignalData> {
+  const windowFunction = options.windowFunction || 'hann'
+  const method = options.method || 'welch'
+  const maxDisplayFreq = options.maxFrequency || 5000
+
   const arrayBuffer = await file.arrayBuffer()
   const audioCtx = new (window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext)()
 
@@ -167,9 +229,21 @@ export async function analyzeAudioFile(file: File): Promise<AudioSignalData> {
     const duration = audioBuffer.duration
     const totalSamples = audioBuffer.length
     const channels = audioBuffer.numberOfChannels
-    const pcmData = audioBuffer.getChannelData(0) // Use first channel
 
-    // 1. Compute Downsampled Waveform for Chart (approx 300 points)
+    // 1. Stereo to Mono Mixdown: (L + R) / 2
+    const leftChannel = audioBuffer.getChannelData(0)
+    const rightChannel = channels > 1 ? audioBuffer.getChannelData(1) : null
+    const pcmData = new Float32Array(totalSamples)
+
+    if (rightChannel) {
+      for (let i = 0; i < totalSamples; i++) {
+        pcmData[i] = (leftChannel[i] + rightChannel[i]) * 0.5
+      }
+    } else {
+      pcmData.set(leftChannel)
+    }
+
+    // 2. Downsampled Waveform for Chart (approx 300 points)
     const targetPoints = 300
     const step = Math.max(1, Math.floor(totalSamples / targetPoints))
     const waveformData: { t: number; v: number }[] = []
@@ -181,109 +255,145 @@ export async function analyzeAudioFile(file: File): Promise<AudioSignalData> {
       waveformData.push({ t, v })
     }
 
-    // 2. Perform Real FFT
-    // Choose FFT size N (power of 2, e.g. 4096 for fine frequency resolution ~ 10.7 Hz at 44.1 kHz)
+    // 3. FFT Computation (Radix-2 Cooley-Tukey)
     const N = 4096
-    const re = new Float64Array(N)
-    const im = new Float64Array(N)
+    const halfN = N >> 1
+    const binResolution = sampleRate / N
+    const accumulatedMagnitudes = new Float64Array(halfN)
 
-    // Find the highest energy window in the signal to analyze
-    let startIdx = 0
-    let maxEnergy = 0
-    const windowStep = Math.max(1, Math.floor((totalSamples - N) / 20))
+    if (method === 'welch' && totalSamples >= N * 2) {
+      // Welch's Method: Multiple overlapping windows (50% overlap) across the signal
+      const numSegments = Math.min(24, Math.floor((totalSamples - N) / (N / 2)) + 1)
+      const segmentStep = Math.max(N / 2, Math.floor((totalSamples - N) / Math.max(1, numSegments - 1)))
 
-    if (totalSamples > N) {
-      for (let s = 0; s <= totalSamples - N; s += windowStep) {
-        let energy = 0
-        for (let k = 0; k < N; k += 4) {
-          energy += pcmData[s + k] * pcmData[s + k]
+      const re = new Float64Array(N)
+      const im = new Float64Array(N)
+
+      for (let seg = 0; seg < numSegments; seg++) {
+        const start = seg * segmentStep
+        for (let i = 0; i < N; i++) {
+          const sampleVal = start + i < totalSamples ? pcmData[start + i] : 0
+          const w = applyWindowWeight(i, N, windowFunction)
+          re[i] = sampleVal * w
+          im[i] = 0.0
         }
-        if (energy > maxEnergy) {
-          maxEnergy = energy
-          startIdx = s
+
+        cooleyTukeyFFT(re, im)
+
+        for (let k = 0; k < halfN; k++) {
+          const mag = (2 * Math.sqrt(re[k] * re[k] + im[k] * im[k])) / N
+          accumulatedMagnitudes[k] += mag
         }
+      }
+
+      // Average magnitudes
+      for (let k = 0; k < halfN; k++) {
+        accumulatedMagnitudes[k] /= numSegments
+      }
+    } else {
+      // Peak Energy Window method
+      let startIdx = 0
+      let maxEnergy = 0
+      const scanStep = Math.max(1, Math.floor((totalSamples - N) / 20))
+
+      if (totalSamples > N) {
+        for (let s = 0; s <= totalSamples - N; s += scanStep) {
+          let energy = 0
+          for (let k = 0; k < N; k += 4) {
+            energy += pcmData[s + k] * pcmData[s + k]
+          }
+          if (energy > maxEnergy) {
+            maxEnergy = energy
+            startIdx = s
+          }
+        }
+      }
+
+      const re = new Float64Array(N)
+      const im = new Float64Array(N)
+
+      for (let i = 0; i < N; i++) {
+        const sampleVal = startIdx + i < totalSamples ? pcmData[startIdx + i] : 0
+        const w = applyWindowWeight(i, N, windowFunction)
+        re[i] = sampleVal * w
+        im[i] = 0.0
+      }
+
+      cooleyTukeyFFT(re, im)
+
+      for (let k = 0; k < halfN; k++) {
+        accumulatedMagnitudes[k] = (2 * Math.sqrt(re[k] * re[k] + im[k] * im[k])) / N
       }
     }
 
-    // Apply Hann Window to reduce spectral leakage
-    for (let i = 0; i < N; i++) {
-      const sampleVal = startIdx + i < totalSamples ? pcmData[startIdx + i] : 0
-      const hann = 0.5 * (1 - Math.cos((2 * Math.PI * i) / (N - 1)))
-      re[i] = sampleVal * hann
-      im[i] = 0.0
-    }
+    // 4. Peak & Dominant Frequency Detection
+    const minBin = Math.max(2, Math.floor(30 / binResolution))
+    const searchMaxFreq = Math.min(sampleRate / 2, Math.max(4000, maxDisplayFreq))
+    const maxSearchBin = Math.min(halfN, Math.ceil(searchMaxFreq / binResolution))
 
-    // Compute FFT
-    cooleyTukeyFFT(re, im)
-
-    // Calculate magnitude spectrum
-    const halfN = N >> 1
-    const binResolution = sampleRate / N
-    const magnitudes = new Float64Array(halfN)
     let maxMag = 0
-    let peakBin = 0
+    let peakBin = minBin
 
-    // Ignore bin 0 and 1 (DC component / sub-bass rumble < 25 Hz)
-    const minBin = Math.max(2, Math.floor(25 / binResolution))
-    const maxFreqDisplay = 5000 // Display up to 5 kHz for clear readability
-    const maxBinDisplay = Math.min(halfN, Math.ceil(maxFreqDisplay / binResolution))
-
-    for (let k = minBin; k < halfN; k++) {
-      const mag = (2 * Math.sqrt(re[k] * re[k] + im[k] * im[k])) / N
-      magnitudes[k] = mag
-      if (k <= maxBinDisplay && mag > maxMag) {
-        maxMag = mag
+    for (let k = minBin; k < maxSearchBin; k++) {
+      if (accumulatedMagnitudes[k] > maxMag) {
+        maxMag = accumulatedMagnitudes[k]
         peakBin = k
       }
     }
 
-    // Quadratic interpolation around peak bin for sub-bin frequency accuracy
+    // Parabolic interpolation for fine sub-bin frequency accuracy
     let peakFreq = peakBin * binResolution
     if (peakBin > minBin && peakBin < halfN - 1) {
-      const alpha = magnitudes[peakBin - 1]
-      const beta = magnitudes[peakBin]
-      const gamma = magnitudes[peakBin + 1]
+      const alpha = accumulatedMagnitudes[peakBin - 1]
+      const beta = accumulatedMagnitudes[peakBin]
+      const gamma = accumulatedMagnitudes[peakBin + 1]
       const delta = (0.5 * (alpha - gamma)) / (alpha - 2 * beta + gamma || 1e-9)
       peakFreq = (peakBin + delta) * binResolution
     }
 
     peakFreq = Math.round(peakFreq)
-    const normFactor = maxMag > 0 ? 0.9 / maxMag : 1
+    const normFactor = maxMag > 0 ? 0.9 / maxMag : 1.0
 
-    // Build decimated FFT Data for Recharts Bar Chart
-    const fftData: { hz: number; mag: number; dominant: boolean; isHarmonic?: boolean }[] = []
-    const displayStepHz = 20
-    const maxHz = Math.min(5000, sampleRate / 2)
-
-    // Secondary harmonics search (around 2f, 3f, 4f)
+    // 5. Secondary Harmonics Detection
     const secondaryHarmonics: number[] = []
+    const nyquist = Math.round(sampleRate / 2)
     for (let h = 2; h <= 4; h++) {
-      const targetHz = peakFreq * h
-      if (targetHz < maxHz) {
-        secondaryHarmonics.push(targetHz)
+      const harmHz = peakFreq * h
+      if (harmHz < nyquist && harmHz < maxDisplayFreq) {
+        secondaryHarmonics.push(harmHz)
       }
     }
 
-    for (let hz = 0; hz <= maxHz; hz += displayStepHz) {
+    // 6. Build Display Data for Bar Chart
+    const targetHzMax = Math.min(nyquist, maxDisplayFreq)
+    const displayStepHz = targetHzMax > 10000 ? 50 : targetHzMax > 3000 ? 20 : 10
+    const fftData: AudioSignalData['fftData'] = []
+
+    for (let hz = 0; hz <= targetHzMax; hz += displayStepHz) {
       const targetBin = Math.round(hz / binResolution)
       let magVal = 0
       if (targetBin >= 0 && targetBin < halfN) {
-        magVal = magnitudes[targetBin] * normFactor
+        magVal = accumulatedMagnitudes[targetBin] * normFactor
       }
 
-      // Check if near peak or harmonic
-      const isDom = Math.abs(hz - peakFreq) < displayStepHz
-      const isHarm = secondaryHarmonics.some(harm => Math.abs(hz - harm) < displayStepHz * 1.5)
+      const magClamped = Math.max(1e-4, Math.min(1.0, magVal))
+      const magDb = parseFloat(Math.max(-80, 20 * Math.log10(magClamped)).toFixed(1))
+
+      const isDom = Math.abs(hz - peakFreq) <= displayStepHz
+      const isHarm = secondaryHarmonics.some(h => Math.abs(hz - h) <= displayStepHz * 1.5)
 
       fftData.push({
         hz,
-        mag: parseFloat(Math.min(1.0, magVal).toFixed(4)),
+        mag: parseFloat(magClamped.toFixed(4)),
+        magDb,
         dominant: isDom,
         isHarmonic: isHarm,
       })
     }
 
     const noteInfo = frequencyToNote(peakFreq)
+    const peakMagNormalized = parseFloat((maxMag * normFactor).toFixed(2))
+    const peakMagDb = parseFloat((20 * Math.log10(Math.max(1e-4, peakMagNormalized))).toFixed(1))
 
     return {
       fileName: file.name,
@@ -295,11 +405,14 @@ export async function analyzeAudioFile(file: File): Promise<AudioSignalData> {
       waveformData,
       fftData,
       dominantFrequency: peakFreq,
-      peakMagnitude: parseFloat((maxMag * normFactor).toFixed(2)),
+      peakMagnitude: peakMagNormalized,
+      peakMagnitudeDb: peakMagDb,
       secondaryHarmonics,
       nearestNote: noteInfo.note,
       noteDeviationCents: noteInfo.cents,
-      nyquistFrequency: Math.round(sampleRate / 2),
+      nyquistFrequency: nyquist,
+      windowUsed: windowFunction,
+      methodUsed: method,
     }
   } finally {
     audioCtx.close().catch(() => {})

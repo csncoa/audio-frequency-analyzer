@@ -5,6 +5,8 @@ import {
 } from 'recharts'
 import {
   type AudioSignalData,
+  type WindowFunction,
+  type AnalysisMethod,
   generateDemoAudioData,
   analyzeAudioFile,
 } from './utils/dsp'
@@ -16,7 +18,7 @@ const NAV_ITEMS = [
   { id: 'dashboard',  label: 'Dashboard',       icon: GridIcon },
   { id: 'analysis',   label: 'Audio Analysis',  icon: WaveIcon },
   { id: 'fft',        label: 'FFT Spectrum',    icon: SpectrumIcon },
-  { id: 'about',      label: 'About DSP',       icon: InfoIcon },
+  { id: 'about',      label: 'About DSP / PSD', icon: InfoIcon },
 ]
 
 // ── SVG icons ─────────────────────────────────────────────────────────────────
@@ -84,12 +86,14 @@ function WaveTooltip({ active, payload, label }: any) {
   )
 }
 
-function FFTTooltip({ active, payload, label }: any) {
+function FFTTooltip({ active, payload, label, isDb }: any) {
   if (!active || !payload?.length) return null
   return (
     <div className="bg-[#0d1526] border border-[#1e2e4a] rounded px-3 py-1.5 text-xs mono shadow-lg">
       <p className="text-[#64748b]">{label} Hz</p>
-      <p className="text-[#22d3ee]">Magnitude |X(f)| = {payload[0]?.value}</p>
+      <p className="text-[#22d3ee]">
+        {isDb ? `Power = ${payload[0]?.value} dB` : `Magnitude |X| = ${payload[0]?.value}`}
+      </p>
     </div>
   )
 }
@@ -139,7 +143,16 @@ function Card({ children, className = '' }: { children: React.ReactNode; classNa
 export default function App() {
   const [activeNav, setActiveNav] = useState('dashboard')
   const [file, setFile] = useState<File | null>(null)
-  const [signalData, setSignalData] = useState<AudioSignalData>(generateDemoAudioData)
+
+  // Advanced DSP Analysis Settings
+  const [windowFunction, setWindowFunction] = useState<WindowFunction>('hann')
+  const [analysisMethod, setAnalysisMethod] = useState<AnalysisMethod>('welch')
+  const [frequencyRange, setFrequencyRange] = useState<number>(5000)
+  const [scaleMode, setScaleMode] = useState<'linear' | 'db'>('linear')
+
+  const [signalData, setSignalData] = useState<AudioSignalData>(() =>
+    generateDemoAudioData({ windowFunction: 'hann', method: 'welch', maxFrequency: 5000 })
+  )
   const [isDemo, setIsDemo] = useState(true)
   const [isDragging, setIsDragging] = useState(false)
   const [analyzed, setAnalyzed] = useState(true)
@@ -183,26 +196,60 @@ export default function App() {
     }
   }, [])
 
-  // Auto-analyze audio immediately upon file upload
-  const processAndAnalyzeFile = async (f: File) => {
-    setAnalyzing(true)
-    setAnalysisError(null)
+  // Auto-analyze audio immediately upon file upload or when DSP options change
+  const processAndAnalyzeFile = useCallback(
+    async (
+      f: File,
+      win = windowFunction,
+      meth = analysisMethod,
+      maxFreq = frequencyRange
+    ) => {
+      setAnalyzing(true)
+      setAnalysisError(null)
 
-    try {
-      // Decode WAV and calculate real Cooley-Tukey Radix-2 FFT
-      const results = await analyzeAudioFile(f)
-      setSignalData(results)
-      setAnalyzed(true)
-      setLiveFreqInfo({
-        freq: results.dominantFrequency,
-        note: results.nearestNote,
-        magnitude: results.peakMagnitude,
-      })
-    } catch (err: any) {
-      console.error('DSP Analysis error:', err)
-      setAnalysisError(err?.message || 'Failed to decode and analyze WAV audio file.')
-    } finally {
-      setAnalyzing(false)
+      try {
+        const results = await analyzeAudioFile(f, {
+          windowFunction: win,
+          method: meth,
+          maxFrequency: maxFreq,
+        })
+        setSignalData(results)
+        setAnalyzed(true)
+        setLiveFreqInfo({
+          freq: results.dominantFrequency,
+          note: results.nearestNote,
+          magnitude: results.peakMagnitude,
+        })
+      } catch (err: any) {
+        console.error('DSP Analysis error:', err)
+        setAnalysisError(err?.message || 'Failed to decode and analyze WAV audio file.')
+      } finally {
+        setAnalyzing(false)
+      }
+    },
+    [windowFunction, analysisMethod, frequencyRange]
+  )
+
+  // Re-run analysis when DSP parameters change
+  const handleDspParamChange = (newWin?: WindowFunction, newMeth?: AnalysisMethod, newRange?: number) => {
+    const win = newWin !== undefined ? newWin : windowFunction
+    const meth = newMeth !== undefined ? newMeth : analysisMethod
+    const range = newRange !== undefined ? newRange : frequencyRange
+
+    if (newWin !== undefined) setWindowFunction(newWin)
+    if (newMeth !== undefined) setAnalysisMethod(newMeth)
+    if (newRange !== undefined) setFrequencyRange(newRange)
+
+    if (file) {
+      processAndAnalyzeFile(file, win, meth, range)
+    } else {
+      setSignalData(
+        generateDemoAudioData({
+          windowFunction: win,
+          method: meth,
+          maxFrequency: range,
+        })
+      )
     }
   }
 
@@ -226,19 +273,22 @@ export default function App() {
     }
 
     // Auto-analyze immediately!
-    processAndAnalyzeFile(f)
+    processAndAnalyzeFile(f, windowFunction, analysisMethod, frequencyRange)
   }
 
-  const handleDrop = useCallback((e: React.DragEvent) => {
-    e.preventDefault()
-    setIsDragging(false)
-    const dropped = e.dataTransfer.files[0]
-    if (dropped && (dropped.name.toLowerCase().endsWith('.wav') || dropped.type.includes('audio'))) {
-      loadFile(dropped)
-    } else {
-      setAnalysisError('Please upload a valid WAV audio file (.wav).')
-    }
-  }, [])
+  const handleDrop = useCallback(
+    (e: React.DragEvent) => {
+      e.preventDefault()
+      setIsDragging(false)
+      const dropped = e.dataTransfer.files[0]
+      if (dropped && (dropped.name.toLowerCase().endsWith('.wav') || dropped.type.includes('audio'))) {
+        loadFile(dropped)
+      } else {
+        setAnalysisError('Please upload a valid WAV audio file (.wav).')
+      }
+    },
+    [loadFile]
+  )
 
   const handleFileInput = (e: React.ChangeEvent<HTMLInputElement>) => {
     const f = e.target.files?.[0]
@@ -303,25 +353,28 @@ export default function App() {
       await realtimeAnalyzer.resume()
 
       audioRef.current.volume = volume / 100
-      audioRef.current.play().then(() => {
-        setPlaying(true)
-        progressInterval.current = setInterval(() => {
-          if (audioRef.current) {
-            const dur = audioRef.current.duration || signalData.duration || 1
-            const ct = audioRef.current.currentTime
-            setCurrentTime(ct)
-            setProgress((ct / dur) * 100)
-            if (ct >= dur) {
-              setPlaying(false)
-              setProgress(0)
-              setCurrentTime(0)
-              clearInterval(progressInterval.current!)
+      audioRef.current
+        .play()
+        .then(() => {
+          setPlaying(true)
+          progressInterval.current = setInterval(() => {
+            if (audioRef.current) {
+              const dur = audioRef.current.duration || signalData.duration || 1
+              const ct = audioRef.current.currentTime
+              setCurrentTime(ct)
+              setProgress((ct / dur) * 100)
+              if (ct >= dur) {
+                setPlaying(false)
+                setProgress(0)
+                setCurrentTime(0)
+                clearInterval(progressInterval.current!)
+              }
             }
-          }
-        }, 100)
-      }).catch(err => {
-        console.warn('Playback error:', err)
-      })
+          }, 100)
+        })
+        .catch(err => {
+          console.warn('Playback error:', err)
+        })
     }
   }
 
@@ -348,7 +401,11 @@ export default function App() {
     stopSyntheticTone()
     setFile(null)
     setIsDemo(true)
-    const demo = generateDemoAudioData()
+    const demo = generateDemoAudioData({
+      windowFunction,
+      method: analysisMethod,
+      maxFrequency: frequencyRange,
+    })
     setSignalData(demo)
     setLiveFreqInfo({
       freq: demo.dominantFrequency,
@@ -373,7 +430,7 @@ export default function App() {
     if (fileInputRef.current) fileInputRef.current.value = ''
   }
 
-  // Export DSP Report
+  // Export Comprehensive DSP Report
   const handleDownload = () => {
     const lines = [
       '========================================================================',
@@ -386,20 +443,27 @@ export default function App() {
       `Nyquist Frequency   : ${signalData.nyquistFrequency.toLocaleString()} Hz`,
       `Duration            : ${signalData.duration.toFixed(2)} s`,
       `Total Samples (N)   : ${signalData.totalSamples.toLocaleString()} samples`,
-      `Channels            : ${signalData.channels === 1 ? 'Mono' : 'Stereo'}`,
+      `Channels            : ${signalData.channels === 1 ? 'Mono' : '2 (Stereo — Mixed L+R)'}`,
       '------------------------------------------------------------------------',
-      'FAST FOURIER TRANSFORM (FFT) ANALYSIS RESULTS',
+      'FAST FOURIER TRANSFORM (FFT) & PSD CONFIGURATION',
       '------------------------------------------------------------------------',
-      `Analysis Algorithm  : Radix-2 Cooley-Tukey FFT with Hann Windowing`,
+      `Analysis Method     : ${signalData.methodUsed === 'welch' ? "Welch's Averaged Periodogram (PSD)" : 'Peak Energy Window'}`,
+      `Windowing Function  : ${signalData.windowUsed.toUpperCase()} Window`,
+      `Magnitude Display   : ${scaleMode === 'db' ? 'Decibels (dB)' : 'Normalized Linear (0-1)'}`,
+      `Frequency Span      : 0 to ${frequencyRange} Hz`,
+      '------------------------------------------------------------------------',
+      'SPECTRAL METRICS & HARMONIC DETECTION',
+      '------------------------------------------------------------------------',
       `Dominant Frequency  : ${signalData.dominantFrequency} Hz`,
       `Nearest Pitch Note  : ${signalData.nearestNote} (${signalData.noteDeviationCents >= 0 ? '+' : ''}${signalData.noteDeviationCents} cents)`,
       `Normalized Peak Mag : ${signalData.peakMagnitude}`,
+      `Peak Magnitude (dB) : ${signalData.peakMagnitudeDb} dB`,
       `Secondary Harmonics : ${signalData.secondaryHarmonics.length > 0 ? signalData.secondaryHarmonics.map(h => `${h} Hz`).join(', ') : 'None detected'}`,
       '',
       'SIGNAL INTERPRETATION:',
-      `The discrete audio signal displays a primary spectral component centered at ${signalData.dominantFrequency} Hz.`,
+      `The discrete audio signal displays a dominant spectral peak at ${signalData.dominantFrequency} Hz (${signalData.nearestNote}).`,
       signalData.secondaryHarmonics.length > 0
-        ? `Secondary harmonic peaks were detected at ${signalData.secondaryHarmonics.join(', ')} Hz, indicating a non-pure tone or harmonic instrument source.`
+        ? `Secondary harmonic peaks were confirmed at ${signalData.secondaryHarmonics.join(', ')} Hz, indicating characteristic musical harmonics or vocal formants.`
         : 'The frequency spectrum indicates a clean fundamental frequency with minimal harmonic distortion.',
       '========================================================================',
       'End of Digital Signal Processing Analysis Report.',
@@ -446,7 +510,7 @@ export default function App() {
             </div>
             <div>
               <p className="text-[13px] font-bold text-[#e2e8f0] leading-tight">AFA</p>
-              <p className="text-[10px] text-[#64748b] leading-tight uppercase tracking-wider mono">DSP Analyzer</p>
+              <p className="text-[10px] text-[#64748b] leading-tight uppercase tracking-wider mono">DSP / PSD Analyzer</p>
             </div>
           </div>
         </div>
@@ -483,7 +547,7 @@ export default function App() {
         {/* Info Box */}
         <div className="mx-3 mb-4 p-3 rounded-lg bg-[#111d33] border border-[#1e2e4a]">
           <p className="text-[10px] text-[#64748b] leading-relaxed">
-            Real-time Web Audio API &amp; Cooley-Tukey Fast Fourier Transform (FFT) analysis.
+            Real-time Web Audio API &amp; Cooley-Tukey Fast Fourier Transform (FFT) with Welch PSD Estimation.
           </p>
         </div>
       </aside>
@@ -496,7 +560,7 @@ export default function App() {
             <h1 className="text-lg font-bold text-[#e2e8f0] leading-tight tracking-tight">
               Audio Frequency Analyzer
             </h1>
-            <p className="text-[11px] text-[#64748b] mt-0.5 mono">Digital Signal Processing — FFT Analysis</p>
+            <p className="text-[11px] text-[#64748b] mt-0.5 mono">Digital Signal Processing — FFT &amp; Power Spectral Density</p>
           </div>
           <div className="flex items-center gap-3">
             {isDemo && (
@@ -528,8 +592,8 @@ export default function App() {
           {activeNav === 'about' && (
             <Card className="p-6 space-y-4">
               <div className="border-b border-[#1e2e4a] pb-3">
-                <h2 className="text-base font-bold text-[#22d3ee]">Digital Signal Processing (DSP) &amp; FFT Overview</h2>
-                <p className="text-xs text-[#64748b] mt-1">Mathematical foundations of discrete audio spectrum analysis.</p>
+                <h2 className="text-base font-bold text-[#22d3ee]">Digital Signal Processing (DSP) &amp; PSD Foundations</h2>
+                <p className="text-xs text-[#64748b] mt-1">Mathematical foundations of discrete audio spectrum and power density analysis.</p>
               </div>
 
               <div className="grid grid-cols-2 gap-5 text-xs text-[#94a3b8] leading-relaxed">
@@ -547,16 +611,30 @@ export default function App() {
                 </div>
 
                 <div className="space-y-3">
-                  <h3 className="text-sm font-semibold text-[#e2e8f0]">2. Nyquist-Shannon Sampling Theorem</h3>
+                  <h3 className="text-sm font-semibold text-[#e2e8f0]">2. Welch&apos;s Method (Power Spectral Density)</h3>
                   <p>
-                    To capture all frequencies without aliasing, the sampling rate (fs) must be at least twice the maximum frequency component (f_max):
+                    For long music signals, standard periodograms exhibit high statistical variance. <strong>Welch&apos;s method</strong> splits the signal into overlapping segments, windows each segment, and averages their squared magnitudes to obtain an unbiased PSD estimate:
+                  </p>
+                  <div className="p-3 bg-[#0d1526] border border-[#1e2e4a] rounded-lg mono text-[11px] text-[#22d3ee]">
+                    P_welch(f) = (1 / K) Σ [i=1 to K] |FFT[x_i(n) * w(n)]|²
+                  </div>
+                </div>
+
+                <div className="space-y-3">
+                  <h3 className="text-sm font-semibold text-[#e2e8f0]">3. Windowing Functions &amp; Spectral Leakage</h3>
+                  <p>
+                    Truncating infinite signals into finite windows causes spectral energy to leak into neighboring frequency bins. Applying smooth window functions (<strong>Hann, Hamming, Blackman</strong>) suppresses side-lobe leakage compared to a sharp <strong>Rectangular window</strong>.
+                  </p>
+                </div>
+
+                <div className="space-y-3">
+                  <h3 className="text-sm font-semibold text-[#e2e8f0]">4. Nyquist-Shannon Sampling Theorem</h3>
+                  <p>
+                    To prevent aliasing distortion, the sampling frequency fs must be at least twice the maximum frequency component (f_max):
                   </p>
                   <div className="p-3 bg-[#0d1526] border border-[#1e2e4a] rounded-lg mono text-[11px] text-[#22d3ee]">
                     f_nyquist = f_s / 2
                   </div>
-                  <p>
-                    For CD quality audio sampled at <strong>44,100 Hz</strong>, the audible band extends up to <strong>22,050 Hz</strong>. Window functions (such as Hann) are applied prior to FFT to attenuate spectral leakage at boundary samples.
-                  </p>
                 </div>
               </div>
 
@@ -632,7 +710,7 @@ export default function App() {
                           </div>
                           <div className="min-w-0">
                             <p className="text-[13px] font-medium text-[#e2e8f0] truncate">{file.name}</p>
-                            <p className="text-[10px] text-[#64748b] mono">{(file.size / 1024).toFixed(1)} KB</p>
+                            <p className="text-[10px] text-[#64748b] mono">{(file.size / (1024 * 1024)).toFixed(2)} MB</p>
                           </div>
                         </div>
                         <button
@@ -648,7 +726,7 @@ export default function App() {
                           ['Duration', `${signalData.duration.toFixed(2)} s`],
                           ['Sample Rate', `${signalData.sampleRate.toLocaleString()} Hz`],
                           ['Samples', signalData.totalSamples.toLocaleString()],
-                          ['Channels', signalData.channels === 1 ? '1 (Mono)' : '2 (Stereo)'],
+                          ['Channels', signalData.channels === 1 ? '1 (Mono)' : '2 (Stereo Mixed L+R)'],
                         ].map(([k, v]) => (
                           <div key={k} className="flex justify-between p-2 rounded bg-[#0d1526]">
                             <span className="text-[#64748b]">{k}</span>
@@ -834,13 +912,13 @@ export default function App() {
                 </Card>
               )}
 
-              {/* Row 4: FFT Spectrum Visualization */}
+              {/* Row 4: FFT & PSD Spectrum Visualization with DSP Parameter Toolbar */}
               {(activeNav === 'dashboard' || activeNav === 'fft') && (
                 <Card className="p-5">
-                  <div className="flex items-center justify-between mb-3">
+                  <div className="flex items-center justify-between mb-3 flex-wrap gap-2">
                     <div>
                       <div className="flex items-center gap-2">
-                        <p className="text-[13px] font-semibold text-[#e2e8f0]">Frequency Domain — FFT Spectrum</p>
+                        <p className="text-[13px] font-semibold text-[#e2e8f0]">Frequency Domain — FFT / PSD Spectrum</p>
                         {playing && (
                           <span className="flex items-center gap-1 text-[9px] px-1.5 py-0.5 rounded bg-[#22d3ee]/10 text-[#22d3ee] border border-[#22d3ee]/20 mono">
                             <span className="w-1.5 h-1.5 rounded-full bg-[#22d3ee] animate-ping" />
@@ -851,17 +929,76 @@ export default function App() {
                       <p className="text-[11px] text-[#64748b] mt-0.5">
                         {fftView === 'live' && playing
                           ? 'Real-time frequency components pulsing to audio playback.'
-                          : 'Frequency components obtained using Fast Fourier Transform (FFT).'}
+                          : `Computed using Radix-2 FFT with ${signalData.windowUsed.toUpperCase()} windowing (${signalData.methodUsed === 'welch' ? 'Welch PSD' : 'Peak Window'}).`}
                       </p>
                     </div>
 
-                    <div className="flex items-center gap-2">
+                    <div className="flex items-center gap-2 flex-wrap">
+                      {/* Window Function Selector */}
+                      <div className="flex items-center gap-1.5 px-2 py-1 rounded-lg bg-[#0d1526] border border-[#1e2e4a] text-[11px] mono">
+                        <span className="text-[#64748b]">Window:</span>
+                        <select
+                          value={windowFunction}
+                          onChange={e => handleDspParamChange(e.target.value as WindowFunction)}
+                          className="bg-transparent text-[#22d3ee] outline-none cursor-pointer font-medium"
+                        >
+                          <option value="hann" className="bg-[#0d1526] text-[#e2e8f0]">Hann</option>
+                          <option value="hamming" className="bg-[#0d1526] text-[#e2e8f0]">Hamming</option>
+                          <option value="blackman" className="bg-[#0d1526] text-[#e2e8f0]">Blackman</option>
+                          <option value="rectangular" className="bg-[#0d1526] text-[#e2e8f0]">Rectangular</option>
+                        </select>
+                      </div>
+
+                      {/* PSD Method Selector */}
+                      <div className="flex items-center gap-1.5 px-2 py-1 rounded-lg bg-[#0d1526] border border-[#1e2e4a] text-[11px] mono">
+                        <span className="text-[#64748b]">Method:</span>
+                        <select
+                          value={analysisMethod}
+                          onChange={e => handleDspParamChange(undefined, e.target.value as AnalysisMethod)}
+                          className="bg-transparent text-[#22d3ee] outline-none cursor-pointer font-medium"
+                        >
+                          <option value="welch" className="bg-[#0d1526] text-[#e2e8f0]">Welch PSD (Avg)</option>
+                          <option value="peak" className="bg-[#0d1526] text-[#e2e8f0]">Peak Energy</option>
+                        </select>
+                      </div>
+
+                      {/* Frequency Range Selector */}
+                      <div className="flex items-center gap-1.5 px-2 py-1 rounded-lg bg-[#0d1526] border border-[#1e2e4a] text-[11px] mono">
+                        <span className="text-[#64748b]">Range:</span>
+                        <select
+                          value={frequencyRange}
+                          onChange={e => handleDspParamChange(undefined, undefined, Number(e.target.value))}
+                          className="bg-transparent text-[#22d3ee] outline-none cursor-pointer font-medium"
+                        >
+                          <option value={2000} className="bg-[#0d1526] text-[#e2e8f0]">0–2 kHz (Voice)</option>
+                          <option value={5000} className="bg-[#0d1526] text-[#e2e8f0]">0–5 kHz (Standard)</option>
+                          <option value={22050} className="bg-[#0d1526] text-[#e2e8f0]">0–22 kHz (Nyquist)</option>
+                        </select>
+                      </div>
+
+                      {/* Linear vs Decibel (dB) scale toggle */}
+                      <div className="flex items-center p-0.5 rounded-lg bg-[#0d1526] border border-[#1e2e4a] text-[11px] mono">
+                        <button
+                          onClick={() => setScaleMode('linear')}
+                          className={`px-2 py-0.5 rounded ${scaleMode === 'linear' ? 'bg-[#22d3ee] text-[#080d1a] font-bold' : 'text-[#64748b] hover:text-[#e2e8f0]'}`}
+                        >
+                          Linear
+                        </button>
+                        <button
+                          onClick={() => setScaleMode('db')}
+                          className={`px-2 py-0.5 rounded ${scaleMode === 'db' ? 'bg-[#22d3ee] text-[#080d1a] font-bold' : 'text-[#64748b] hover:text-[#e2e8f0]'}`}
+                        >
+                          dB Scale
+                        </button>
+                      </div>
+
+                      {/* Live vs Static Toggle */}
                       <div className="flex items-center p-0.5 rounded-lg bg-[#0d1526] border border-[#1e2e4a] text-[11px] mono">
                         <button
                           onClick={() => setFftView('live')}
                           className={`px-2 py-0.5 rounded ${fftView === 'live' ? 'bg-[#22d3ee] text-[#080d1a] font-bold' : 'text-[#64748b] hover:text-[#e2e8f0]'}`}
                         >
-                          Live Spectrum (60 FPS)
+                          Live Spectrum
                         </button>
                         <button
                           onClick={() => setFftView('static')}
@@ -899,7 +1036,7 @@ export default function App() {
                     />
                   ) : (
                     <ResponsiveContainer width="100%" height={activeNav === 'fft' ? 280 : 200}>
-                      <BarChart data={fftChartData} margin={{ top: 4, right: 8, left: -20, bottom: 4 }} barCategoryGap={0}>
+                      <BarChart data={fftChartData} margin={{ top: 4, right: 8, left: -10, bottom: 4 }} barCategoryGap={0}>
                         <CartesianGrid strokeDasharray="3 3" stroke="#1e2e4a" vertical={false} />
                         <XAxis
                           dataKey="hz" tickLine={false} axisLine={false}
@@ -911,18 +1048,22 @@ export default function App() {
                         <YAxis
                           tickLine={false} axisLine={false}
                           tick={{ fontSize: 10, fill: '#64748b', fontFamily: 'JetBrains Mono' }}
-                          domain={[0, 1]}
-                          tickCount={4}
+                          domain={scaleMode === 'db' ? [-80, 0] : [0, 1]}
+                          tickCount={5}
+                          tickFormatter={v => scaleMode === 'db' ? `${v}dB` : `${v}`}
                         />
-                        <Tooltip content={<FFTTooltip />} />
-                        <Bar dataKey="mag" radius={[1, 1, 0, 0]}>
-                          {fftChartData.map((entry, i) => (
-                            <Cell
-                              key={i}
-                              fill={entry.dominant ? '#22d3ee' : entry.isHarmonic ? '#38bdf8' : entry.mag > 0.2 ? '#3b82f6' : '#1d4ed8'}
-                              opacity={entry.dominant ? 1 : entry.isHarmonic ? 0.9 : entry.mag > 0.2 ? 0.8 : 0.45}
-                            />
-                          ))}
+                        <Tooltip content={<FFTTooltip isDb={scaleMode === 'db'} />} />
+                        <Bar dataKey={scaleMode === 'db' ? 'magDb' : 'mag'} radius={[1, 1, 0, 0]}>
+                          {fftChartData.map((entry, i) => {
+                            const isAbove = scaleMode === 'db' ? entry.magDb > -40 : entry.mag > 0.2
+                            return (
+                              <Cell
+                                key={i}
+                                fill={entry.dominant ? '#22d3ee' : entry.isHarmonic ? '#38bdf8' : isAbove ? '#3b82f6' : '#1d4ed8'}
+                                opacity={entry.dominant ? 1 : entry.isHarmonic ? 0.9 : isAbove ? 0.8 : 0.45}
+                              />
+                            )
+                          })}
                         </Bar>
                       </BarChart>
                     </ResponsiveContainer>
@@ -955,9 +1096,12 @@ export default function App() {
                       {[
                         ['Dominant Frequency', `${signalData.dominantFrequency} Hz`],
                         ['Musical Pitch', `${signalData.nearestNote} (${signalData.noteDeviationCents >= 0 ? '+' : ''}${signalData.noteDeviationCents} cents)`],
-                        ['Peak Magnitude', `${signalData.peakMagnitude}`],
+                        ['Peak Magnitude (Linear)', `${signalData.peakMagnitude}`],
+                        ['Peak Magnitude (Decibels)', `${signalData.peakMagnitudeDb} dB`],
                         ['Nyquist Limit', `${signalData.nyquistFrequency.toLocaleString()} Hz`],
-                        ['Analysis Method', 'Radix-2 Cooley-Tukey FFT (Hann Window)'],
+                        ['Channels', signalData.channels === 1 ? '1 (Mono)' : '2 (Stereo — Mixed L+R)'],
+                        ['Analysis Method', signalData.methodUsed === 'welch' ? "Welch's Averaged Periodogram (PSD)" : 'Peak Energy Window'],
+                        ['Window Function', `${signalData.windowUsed.toUpperCase()} Window`],
                       ].map(([k, v]) => (
                         <div key={k} className="flex items-center justify-between py-2 border-b border-[#1e2e4a] last:border-0">
                           <span className="text-[12px] text-[#64748b]">{k}</span>
@@ -997,10 +1141,10 @@ export default function App() {
                         <svg className="animate-spin" width={14} height={14} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2.5}>
                           <path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83" />
                         </svg>
-                        Computing FFT Analysis…
+                        Computing FFT / PSD…
                       </>
                     ) : (
-                      <><SpectrumIcon size={14} /> Re-Analyze Full Track</>
+                      <><SpectrumIcon size={14} /> Re-Calculate Spectrum</>
                     )}
                   </button>
 
