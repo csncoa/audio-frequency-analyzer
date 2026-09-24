@@ -1,1 +1,74 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&display=swap');
 @import 'tailwindcss';
+
+@theme {
+  --color-bg: #080d1a;
+  --color-surface: #0d1526;
+  --color-card: #111d33;
+  --color-card-hover: #152040;
+  --color-border: #1e2e4a;
+  --color-border-bright: #2a4070;
+  --color-cyan: #22d3ee;
+  --color-blue: #3b82f6;
+  --color-blue-dim: #1d4ed8;
+  --color-text: #e2e8f0;
+  --color-muted: #64748b;
+  --color-dim: #94a3b8;
+  --font-sans: 'Inter', sans-serif;
+  --font-mono: 'JetBrains Mono', monospace;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  background-color: #080d1a;
+  color: #e2e8f0;
+  font-family: 'Inter', sans-serif;
+  margin: 0;
+}
+
+::-webkit-scrollbar {
+  width: 4px;
+  height: 4px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: #1e2e4a;
+  border-radius: 2px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #2a4070;
+}
+
+.mono {
+  font-family: 'JetBrains Mono', monospace;
+}
+
+input[type="range"] {
+  -webkit-appearance: none;
+  appearance: none;
+  background: transparent;
+  cursor: pointer;
+}
+
+input[type="range"]::-webkit-slider-track {
+  background: #1e2e4a;
+  height: 3px;
+  border-radius: 2px;
+}
+
+input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  background: #22d3ee;
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  margin-top: -4.5px;
+}
+
